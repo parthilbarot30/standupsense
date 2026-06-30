@@ -309,13 +309,55 @@ async function getUserName(userId) {
 }
 
 // ── Helper: group messages by user ───────────────────────────
+// ── Noise filter: strip messages unlikely to contain work content ──
+const NOISE_PATTERNS = [
+  /^(hi|hey|hello|hiya|yo|sup)[\s!.,]*$/i,
+  /^(good\s?morning|good\s?afternoon|good\s?evening|gm|gn)[\s!.,]*$/i,
+  /^(ok|okay|cool|nice|great|awesome|sounds good|sure|yep|yes|no|np|thanks|thank you|thx|ty)[\s!.,]*$/i,
+  /^(lol|lmao|haha|hehe|😂|👍|🙌|🎉)+[\s!.,]*$/i,
+  /^(brb|back|afk|lunch|on a call|in a meeting)[\s!.,]*$/i,
+  /^[\p{Emoji}\s]+$/u, // emoji-only messages
+  /^<@[\w]+>$/, // bare @mention with nothing else
+  /^https?:\/\/\S+$/, // link-only messages with no surrounding text
+  /^\?+$/, // just question marks
+  /^.{1,3}$/, // anything 3 characters or fewer is almost never a work update
+];
+
+function isLikelyNoise(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return NOISE_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+// ── Helper: group messages by user, filtering noise + capping volume ──
+const MAX_MESSAGES_PER_USER = 25; // protects token budget on very chatty channels
+
 function groupMessagesByUser(messages) {
   const grouped = {};
+  let noiseFiltered = 0;
+
   for (const msg of messages) {
     if (!msg.user) continue;
+    if (isLikelyNoise(msg.text)) {
+      noiseFiltered++;
+      continue;
+    }
     if (!grouped[msg.user]) grouped[msg.user] = [];
     grouped[msg.user].push(msg.text);
   }
+
+  // Cap per-user volume — keep the most recent N messages if someone is very chatty,
+  // since recent messages are more likely to reflect current status
+  for (const userId of Object.keys(grouped)) {
+    if (grouped[userId].length > MAX_MESSAGES_PER_USER) {
+      grouped[userId] = grouped[userId].slice(-MAX_MESSAGES_PER_USER);
+    }
+  }
+
+  if (noiseFiltered > 0) {
+    console.log(`🧹 Filtered out ${noiseFiltered} noise message(s) before AI extraction`);
+  }
+
   return grouped;
 }
 
@@ -343,7 +385,7 @@ async function extractStandupWithGroq(userName, messages) {
         {
           role: "system",
           content:
-            "You are an expert coordinator for an education nonprofit. Extract volunteer standup updates from Slack messages. Return only valid raw JSON, no markdown, no backticks, no explanation.",
+            "You are an expert coordinator for an education nonprofit. Extract volunteer standup updates from Slack messages. These messages may include casual conversation, jokes, scheduling chatter, or off-topic discussion mixed in with real work updates — ignore anything that isn't a genuine work update. Do not infer or invent details that aren't explicitly stated. Return only valid raw JSON, no markdown, no backticks, no explanation.",
         },
         {
           role: "user",
@@ -352,13 +394,17 @@ async function extractStandupWithGroq(userName, messages) {
 ${messageText}
 ---
 
-Extract their standup update. Look for teaching sessions completed, students helped, lessons planned, and any resource blockers.
+Extract ONLY their genuine standup update — teaching sessions completed, students helped, lessons planned, and any resource blockers they explicitly mentioned.
+
+Ignore: greetings, jokes, casual banter, scheduling logistics unrelated to teaching work, questions to other people, and anything vague or ambiguous. If a message doesn't clearly describe work done, work in progress, or a real blocker, do not include it.
+
+If NONE of the messages contain genuine work content, return all fields as null — do not fabricate an update just because messages exist.
 
 Return ONLY this JSON:
 {
-  "completed": "what they finished or accomplished today, or null if nothing mentioned",
-  "working_on": "what they are currently doing or planning, or null if nothing mentioned",
-  "blocker": "anything blocking them, resources needed, or waiting on, or null if no blockers"
+  "completed": "what they finished or accomplished today, or null if nothing clearly stated",
+  "working_on": "what they are currently doing or planning, or null if nothing clearly stated",
+  "blocker": "anything blocking them, resources needed, or waiting on, or null if no blockers mentioned"
 }`,
         },
       ],
