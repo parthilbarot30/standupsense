@@ -29,6 +29,7 @@ const {
   ListToolsResultSchema,
   CallToolResultSchema,
 } = require("@modelcontextprotocol/sdk/types.js");
+const http = require("http");
 
 // ── Initialize Slack ─────────────────────────────────────────
 const app = new App({
@@ -771,6 +772,18 @@ process.on("SIGINT", () => {
 
 // ── Start everything ──────────────────────────────────────────
 (async () => {
+  // 0. Start a tiny HTTP server so Render's port scanner detects the service is alive
+  // (Slack Socket Mode doesn't open any inbound port on its own)
+  const HEALTH_PORT = process.env.PORT || 3000;
+  http
+    .createServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", service: "StandupSense for Education" }));
+    })
+    .listen(HEALTH_PORT, () => {
+      console.log(`🌐 Health check server listening on port ${HEALTH_PORT}`);
+    });
+
   // 1. Start Notion MCP server first
   await startMCPServer();
 
