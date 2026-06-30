@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: standupsense
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: NOTION_MCP_PORT
+        value: 3001
+      - key: NOTION_MCP_AUTH_TOKEN
+        value: standupsense-mcp-secret
+      - key: PORT
+        value: 3000

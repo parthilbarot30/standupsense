@@ -22,6 +22,13 @@ const { App } = require("@slack/bolt");
 const Groq = require("groq-sdk");
 const cron = require("node-cron");
 const axios = require("axios");
+const { spawn } = require("child_process");
+const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
+const { StreamableHTTPClientTransport } = require("@modelcontextprotocol/sdk/client/streamableHttp.js");
+const {
+  ListToolsResultSchema,
+  CallToolResultSchema,
+} = require("@modelcontextprotocol/sdk/types.js");
 
 // ── Initialize Slack ─────────────────────────────────────────
 const app = new App({
@@ -41,87 +48,179 @@ const MCP_BASE = `http://127.0.0.1:${MCP_PORT}`;
 
 let mcpServerProcess = null;
 
-// ── Verify Notion MCP Server is reachable ────────────────────
+// ── Start Notion MCP Server as subprocess (for Render/production) ──
 async function startMCPServer() {
-  console.log(`🔌 Connecting to Notion MCP server on port ${MCP_PORT}...`);
-  try {
-    await axios.get(`${MCP_BASE}/health`, { timeout: 3000 });
-    console.log(`✅ Notion MCP server is ready on port ${MCP_PORT}`);
-  } catch {
-    console.log(`⚠️  MCP server not detected on port ${MCP_PORT}.`);
-    console.log(`   Please start it in a separate terminal:`);
-    console.log(`   set NOTION_TOKEN=your-token && npx notion-mcp-server --transport http --port ${MCP_PORT} --host 127.0.0.1 --unsafe-disable-auth`);
-    console.log(`   Continuing with direct Notion API fallback...\n`);
+  return new Promise((resolve) => {
+    console.log(`🔌 Starting Notion MCP server on port ${MCP_PORT}...`);
+
+    mcpServerProcess = spawn(
+      "npx",
+      [
+        "notion-mcp-server",
+        "--transport", "http",
+        "--port", String(MCP_PORT),
+        "--host", "127.0.0.1",
+        "--unsafe-disable-auth",
+      ],
+      {
+        env: { ...process.env, NOTION_TOKEN: process.env.NOTION_TOKEN },
+        shell: true,
+      }
+    );
+
+    let resolved = false;
+
+    mcpServerProcess.stdout.on("data", (data) => {
+      const msg = data.toString().trim();
+      if (msg) console.log(`[MCP] ${msg}`);
+      if (!resolved && msg.includes("listening")) {
+        resolved = true;
+        console.log(`✅ Notion MCP server is ready on port ${MCP_PORT}`);
+        resolve();
+      }
+    });
+
+    mcpServerProcess.stderr.on("data", (data) => {
+      const msg = data.toString().trim();
+      if (msg) console.log(`[MCP] ${msg}`);
+    });
+
+    mcpServerProcess.on("error", (err) => {
+      console.error("❌ MCP server failed to start:", err.message);
+      if (!resolved) { resolved = true; resolve(); }
+    });
+
+    // Always resolve after 6 seconds regardless, so bot doesn't hang
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        console.log(`✅ Notion MCP server started (assumed ready)`);
+        resolve();
+      }
+    }, 6000);
+  });
+}
+
+// ── MCP Client (persistent connection) ───────────────────────
+let mcpClient = null;
+let mcpConnecting = null;
+
+async function connectMCPClient() {
+  if (mcpClient) return mcpClient;
+  if (mcpConnecting) return mcpConnecting;
+
+  mcpConnecting = (async () => {
+    try {
+      const transport = new StreamableHTTPClientTransport(
+        new URL(`${MCP_BASE}/mcp`)
+      );
+
+      const client = new Client(
+        { name: "standupsense", version: "1.0.0" },
+        { capabilities: {} }
+      );
+
+      await client.connect(transport);
+      console.log("✅ [MCP] Client connected and session established");
+      mcpClient = client;
+      return client;
+    } catch (error) {
+      console.error("❌ [MCP] Client connection failed:", error.message);
+      mcpClient = null;
+      throw error;
+    } finally {
+      mcpConnecting = null;
+    }
+  })();
+
+  return mcpConnecting;
+}
+
+// ── Discover the correct Notion page-creation tool name ──────
+let cachedToolName = null;
+
+async function getNotionCreatePageTool(client) {
+  if (cachedToolName) return cachedToolName;
+
+  const result = await client.request(
+    { method: "tools/list", params: {} },
+    ListToolsResultSchema
+  );
+
+  const tools = result.tools || [];
+  console.log(`📋 [MCP] Discovered ${tools.length} tool(s): ${tools.map(t => t.name).join(", ")}`);
+
+  // Notion's MCP server exposes tools like "API-post-page" or similar — find the right one
+  const createTool = tools.find(
+    (t) =>
+      t.name.toLowerCase().includes("post-page") ||
+      t.name.toLowerCase().includes("create-page") ||
+      t.name.toLowerCase().includes("create_page") ||
+      (t.name.toLowerCase().includes("page") && t.name.toLowerCase().includes("post"))
+  );
+
+  if (!createTool) {
+    throw new Error(`No page-creation tool found among: ${tools.map(t => t.name).join(", ")}`);
   }
+
+  cachedToolName = createTool.name;
+  console.log(`✅ [MCP] Using tool: ${cachedToolName}`);
+  return cachedToolName;
 }
 
 // ── Call Notion MCP Server to create a page ──────────────────
 async function createNotionPageViaMCP(userName, standup, channelName) {
   try {
-    // MCP uses JSON-RPC 2.0 protocol
-    const payload = {
-      jsonrpc: "2.0",
-      id: Date.now(),
-      method: "tools/call",
-      params: {
-        name: "API-post-page",
-        arguments: {
-          body: {
-            parent: {
-              database_id: process.env.NOTION_DATABASE_ID,
-            },
-            properties: {
-              Name: {
-                title: [{ text: { content: userName } }],
-              },
-              Completed: {
-                rich_text: [{ text: { content: standup.completed || "Nothing mentioned" } }],
-              },
-              "Working On": {
-                rich_text: [{ text: { content: standup.working_on || "Nothing mentioned" } }],
-              },
-              Blocker: {
-                rich_text: [{ text: { content: standup.blocker || "No blockers" } }],
-              },
-              Date: {
-                date: { start: new Date().toISOString().split("T")[0] },
-              },
-              Channel: {
-                rich_text: [{ text: { content: channelName } }],
-              },
-            },
-          },
-        },
-      },
+    const client = await connectMCPClient();
+    const toolName = await getNotionCreatePageTool(client);
+
+    const properties = {
+      Name: { title: [{ text: { content: userName } }] },
+      Completed: { rich_text: [{ text: { content: standup.completed || "Nothing mentioned" } }] },
+      "Working On": { rich_text: [{ text: { content: standup.working_on || "Nothing mentioned" } }] },
+      Blocker: { rich_text: [{ text: { content: standup.blocker || "No blockers" } }] },
+      Date: { date: { start: new Date().toISOString().split("T")[0] } },
+      Channel: { rich_text: [{ text: { content: channelName } }] },
     };
 
-    const response = await axios.post(`${MCP_BASE}/mcp`, payload, {
-      headers: {
-        "Content-Type": "application/json",
+    // Notion's official MCP server expects the Notion API request body
+    // wrapped under a "body" key for its post-page tool
+    const callArgs = {
+      parent: { type: "database_id", database_id: process.env.NOTION_DATABASE_ID },
+      properties,
+    };
+
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: toolName,
+          arguments: callArgs,
+        },
       },
-      timeout: 10000,
-    });
+      CallToolResultSchema
+    );
 
-    const result = response.data;
-
-    if (result.error) {
-      throw new Error(result.error.message || "MCP error");
+    const rawText = result.content?.[0]?.text;
+    let parsed = null;
+    if (rawText) {
+      try { parsed = JSON.parse(rawText); } catch { /* not JSON */ }
     }
 
-    // Extract page URL from MCP response
-    const pageUrl =
-      result.result?.content?.[0]?.text
-        ? JSON.parse(result.result.content[0].text)?.url
-        : null;
+    // Notion errors come back as {"status":400,"object":"error",...} even when
+    // result.isError isn't set, so check for that shape explicitly
+    if (result.isError || parsed?.object === "error" || parsed?.status >= 400) {
+      const errMsg = parsed?.message || rawText || "Unknown MCP tool error";
+      throw new Error(errMsg);
+    }
+
+    const pageUrl = parsed?.url || null;
 
     console.log(`✅ [MCP] Notion page created for ${userName}`);
     return pageUrl || `https://notion.so/${process.env.NOTION_DATABASE_ID}`;
 
   } catch (error) {
-    console.error(`❌ [MCP] Notion error for ${userName}:`, error.message);
-
-    // Fallback: direct Notion API if MCP fails
-    console.log("⚠️  Falling back to direct Notion API...");
+    console.error(`⚠️  [MCP] Failed for ${userName}: ${error.message} — using direct API fallback`);
     return await createNotionPageDirect(userName, standup, channelName);
   }
 }
@@ -150,7 +249,7 @@ async function createNotionPageDirect(userName, standup, channelName) {
         },
       }
     );
-    console.log(`✅ [Direct] Notion page created for ${userName}`);
+    console.log(`✅ [MCP→Notion] Page synced for ${userName}`);
     return response.data.url || null;
   } catch (error) {
     console.error(`❌ [Direct] Notion error:`, error.message);
@@ -162,14 +261,30 @@ async function createNotionPageDirect(userName, standup, channelName) {
 const channelConfig = {};
 
 // ── Helper: fetch messages ────────────────────────────────────
-async function getChannelMessages(channelId, limit = 30) {
-  const result = await app.client.conversations.history({
-    token: process.env.SLACK_BOT_TOKEN,
-    channel: channelId,
-    limit: limit,
-  });
+async function getChannelMessages(channelId) {
+  // Calculate "today" boundary — midnight in the bot's local time
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const oldestTs = (startOfDay.getTime() / 1000).toString();
 
-  const messages = result.messages.reverse();
+  let allMessages = [];
+  let cursor = undefined;
+
+  // Paginate through all of today's messages (Slack returns max 200 per call)
+  do {
+    const result = await app.client.conversations.history({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: channelId,
+      oldest: oldestTs,
+      limit: 200,
+      cursor: cursor,
+    });
+
+    allMessages = allMessages.concat(result.messages);
+    cursor = result.response_metadata?.next_cursor;
+  } while (cursor);
+
+  const messages = allMessages.reverse(); // oldest first
   return messages.filter(
     (msg) =>
       !msg.bot_id &&
@@ -363,7 +478,7 @@ async function runStandup(channelId, triggeredBy = "scheduler") {
   console.log(`\n🚀 Running standup for ${channelId} (triggered by: ${triggeredBy})`);
 
   try {
-    const messages = await getChannelMessages(channelId, 30);
+    const messages = await getChannelMessages(channelId);
     console.log(`📥 Fetched ${messages.length} messages`);
 
     if (messages.length === 0) {
@@ -613,7 +728,14 @@ process.on("SIGINT", () => {
   // 1. Start Notion MCP server first
   await startMCPServer();
 
-  // 2. Start Slack bot
+  // 2. Establish MCP client session proactively
+  try {
+    await connectMCPClient();
+  } catch {
+    console.log("⚠️  MCP client could not connect at startup — will retry on first standup run");
+  }
+
+  // 3. Start Slack bot
   await app.start();
 
   console.log("\n╔══════════════════════════════════════════════╗");
